@@ -337,7 +337,7 @@ with tab2:
     # Порівняльний графік траєкторій
     fig2 = go.Figure()
     fig2.add_trace(go.Scatter(y=data_arr,     name=f"Базова (H={h_base:.2f})", line=dict(color="#7eb8f7")))
-    fig2.add_trace(go.Scatter(y=data_chaotic, name=f"Хаотична (H={h_chaotic:.2f})", line=dict(color="#f97316", opacity=0.75)))
+    fig2.add_trace(go.Scatter(y=data_chaotic, name=f"Хаотична (H={h_chaotic:.2f})", line=dict(color="#f97316"), opacity=0.75))
     fig2.update_layout(title="Порівняння алгоритмів навігації БПЛА", **PLOTLY_LAYOUT,
                        height=380, xaxis_title="Часовий крок", yaxis_title="Позиція")
     st.plotly_chart(fig2, use_container_width=True)
