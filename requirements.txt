@@ -5,3 +5,5 @@ numpy>=1.24.0
 statsmodels>=0.14.0
 nolds>=0.5.2
 scipy>=1.11.0
+matplotlib
+scikit-learn

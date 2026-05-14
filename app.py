@@ -5,7 +5,6 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.stattools import acf as sm_acf, pacf as sm_pacf
@@ -291,7 +290,12 @@ with st.sidebar:
     data_source = st.radio("", ["Синтетичні дані", "Завантажити CSV"], label_visibility="collapsed")
     uploaded = None
     if data_source == "Завантажити CSV":
-        uploaded = st.file_uploader("CSV з колонкою position", type="csv")
+        uploaded = st.file_uploader("Завантажити CSV файл", type="csv")
+        if uploaded:
+            _df_preview = pd.read_csv(uploaded)
+            uploaded.seek(0)
+            _numeric_cols = _df_preview.select_dtypes(include="number").columns.tolist()
+            selected_col = st.selectbox("Оберіть колонку для аналізу", _numeric_cols) if _numeric_cols else None
 
     st.markdown("### 🚁 Алгоритм навігації")
     nav_mode = st.selectbox("", ["linear", "waypoint", "survey", "patrol", "chaotic"],
@@ -329,7 +333,8 @@ st.markdown("---")
 # ═══════════════════════════════════════════════════════════════════════════════
 if uploaded and data_source == "Завантажити CSV":
     df_up = pd.read_csv(uploaded)
-    col = df_up.columns[0]
+    numeric_cols = df_up.select_dtypes(include="number").columns.tolist()
+    col = selected_col if (selected_col and selected_col in numeric_cols) else (numeric_cols[0] if numeric_cols else df_up.columns[0])
     data_arr = df_up[col].dropna().values[:n_points]
     n_points = len(data_arr)
 else:
