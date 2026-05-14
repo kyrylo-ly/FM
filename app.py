@@ -276,7 +276,7 @@ PLOTLY_LAYOUT = dict(
     font=dict(color="#c8d8f0", family="Inter"),
     xaxis=dict(gridcolor="#1e3a5f", showgrid=True),
     yaxis=dict(gridcolor="#1e3a5f", showgrid=True),
-    legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor="#1e3a5f"),
+    legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor="#1e3a5f", font=dict(color="#c8d8f0", family="Inter")),
 )
 
 
