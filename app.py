@@ -649,7 +649,7 @@ with tab5:
 st.markdown("---")
 st.markdown(
     '<p class="footer-text" style="text-align:center">© 2026 Команда 1 | '
-    'Іванченко А., Петренко Б., Коваль В., Шевченко Г. | '
+    'Литвішко К., Прокопів О., Мартинович В., Загайко В. | '
     'Тема 18: Фрактальний аналіз траєкторій БПЛА | Streamlit + Plotly</p>',
     unsafe_allow_html=True,
 )
