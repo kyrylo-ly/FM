@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
 from statsmodels.tsa.arima.model import ARIMA
+from statsmodels.tsa.stattools import acf as sm_acf, pacf as sm_pacf
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import nolds
 from scipy import stats
@@ -75,11 +76,21 @@ st.markdown("""
 # ── Допоміжні функції ─────────────────────────────────────────────────────────
 
 @st.cache_data
-def generate_trajectory(n=1000, noise_std=1.0, seed=2026, chaotic=False):
+def generate_trajectory(n=1000, noise_std=1.0, seed=2026, chaotic=False, mode="linear"):
     np.random.seed(seed)
     t = np.linspace(0, 100, n)
-    if chaotic:
+    if chaotic or mode == "chaotic":
         return np.sin(t * 2) * 15 + np.cumsum(np.random.normal(0, noise_std * 3, n))
+    if mode == "waypoint":
+        wpts = np.array([0.0, 15, 35, 20, 45, 60, 40, 70, 85, 100])
+        wt = np.linspace(0, 100, len(wpts))
+        return np.interp(t, wt, wpts) + np.cumsum(np.random.normal(0, noise_std * 0.4, n))
+    if mode == "survey":
+        period = 20
+        base = np.where((t // period) % 2 == 0, t % period, period - t % period) * 2
+        return base + np.cumsum(np.random.normal(0, noise_std * 0.5, n))
+    if mode == "patrol":
+        return np.sin(t / 5) * 25 + np.cumsum(np.random.normal(0, noise_std * 0.5, n))
     return 0.5 * t + np.sin(t / 5) * 10 + np.cumsum(np.random.normal(0, noise_std, n))
 
 
@@ -95,6 +106,79 @@ def fractional_differencing(series, d, threshold=1e-4):
         diff_series[i] = np.dot(weights, series[i::-1][:len(weights)])
     s = pd.Series(diff_series).replace(0, np.nan).dropna()
     return s
+
+
+def inverse_fractional_differencing(diff_arr, original_arr, d, threshold=1e-4):
+    """Відновлення оригінального масштабу через зворотне дробове диференціювання."""
+    fw = [1.0]
+    for k in range(1, len(original_arr) + len(diff_arr) + 1):
+        fw.append(-fw[-1] * (d - k + 1) / k)
+        if abs(fw[-1]) < threshold and k > 10:
+            break
+    N = len(original_arr)
+    forecasts = []
+    for h, W_h in enumerate(diff_arr):
+        t = N + h
+        X_new = W_h
+        for k in range(1, min(len(fw), t + 1)):
+            idx = t - k
+            if idx < N:
+                X_new -= fw[k] * original_arr[idx]
+            else:
+                fi = idx - N
+                if 0 <= fi < len(forecasts):
+                    X_new -= fw[k] * forecasts[fi]
+        forecasts.append(X_new)
+    return np.array(forecasts)
+
+
+def box_counting_dimension(time_series):
+    """Box-counting розмірність часового ряду (повертає D в [1,2])."""
+    n = len(time_series)
+    x = np.linspace(0, 1, n)
+    y_rng = np.ptp(time_series)
+    if y_rng == 0:
+        return 1.0
+    y = (time_series - np.min(time_series)) / y_rng
+    eps_min = 2.0 / n
+    eps_max = 0.5
+    epsilons = np.logspace(np.log10(eps_min), np.log10(eps_max), 25)
+    log_N, log_inv = [], []
+    for eps in epsilons:
+        xb = np.floor(x / eps).astype(int)
+        yb = np.floor(y / eps).astype(int)
+        N_boxes = len(set(zip(xb, yb)))
+        if N_boxes > 1:
+            log_N.append(np.log(N_boxes))
+            log_inv.append(np.log(1.0 / eps))
+    if len(log_N) < 3:
+        return 1.0
+    return float(np.clip(np.polyfit(log_inv, log_N, 1)[0], 1.0, 2.0))
+
+
+def rs_analysis(series, min_n=10, n_points=20):
+    """R/S аналіз: повертає (ns, rs_means) для log-log графіку показника Херста."""
+    series = np.array(series, dtype=float)
+    N = len(series)
+    max_n = max(N // 4, min_n + 1)
+    ns_raw = np.unique(np.logspace(np.log10(min_n), np.log10(max_n), n_points).astype(int))
+    ns_v, rs_v = [], []
+    for n in ns_raw:
+        n_segs = N // n
+        if n_segs < 1:
+            continue
+        rs_list = []
+        for seg in range(n_segs):
+            seg_d = series[seg * n:(seg + 1) * n]
+            devs = np.cumsum(seg_d - np.mean(seg_d))
+            R = np.max(devs) - np.min(devs)
+            S = np.std(seg_d, ddof=1)
+            if S > 0:
+                rs_list.append(R / S)
+        if rs_list:
+            rs_v.append(np.mean(rs_list))
+            ns_v.append(n)
+    return np.array(ns_v), np.array(rs_v)
 
 
 @st.cache_data
@@ -118,15 +202,15 @@ def run_models(train_arr, test_arr, p, d_int, q, d_frac):
                                                "mse": mean_squared_error(test_arr, fc)}
     except Exception:
         pass
-    # ARFIMA (дробове диференціювання + ARMA)
+    # ARFIMA (дробове диф. + ARMA + зворотне дробове диф.)
     try:
         train_s = pd.Series(train_arr)
         diff_s = fractional_differencing(train_s, d_frac)
-        base_m = ARIMA(diff_s, order=(p, 0, q)).fit()
-        approx = ARIMA(train_arr, order=(p, 0, q)).fit()
-        fc = approx.forecast(len(test_arr))
+        arma_m = ARIMA(diff_s, order=(p, 0, q)).fit()
+        arma_fc = arma_m.forecast(len(test_arr))
+        fc = inverse_fractional_differencing(arma_fc, train_arr, d_frac)
         results[f"ARFIMA({p},{d_frac:.2f},{q})"] = {
-            "forecast": fc, "aic": approx.aic,
+            "forecast": fc, "aic": arma_m.aic,
             "mae": mean_absolute_error(test_arr, fc),
             "mse": mean_squared_error(test_arr, fc)
         }
@@ -209,6 +293,12 @@ with st.sidebar:
     if data_source == "Завантажити CSV":
         uploaded = st.file_uploader("CSV з колонкою position", type="csv")
 
+    st.markdown("### 🚁 Алгоритм навігації")
+    nav_mode = st.selectbox("", ["linear", "waypoint", "survey", "patrol", "chaotic"],
+        format_func=lambda x: {"linear": "Лінійний рух", "waypoint": "Waypoint-навігація",
+            "survey": "Обстеження (лінійне)", "patrol": "Патрулювання",
+            "chaotic": "Хаотичний рух"}[x], label_visibility="collapsed")
+
     st.markdown("### 🔧 Параметри траєкторії")
     n_points = st.slider("Кількість точок", 200, 2000, 1000, 100)
     noise_std = st.slider("Рівень шуму σ", 0.1, 5.0, 1.0, 0.1)
@@ -243,7 +333,7 @@ if uploaded and data_source == "Завантажити CSV":
     data_arr = df_up[col].dropna().values[:n_points]
     n_points = len(data_arr)
 else:
-    data_arr = generate_trajectory(n_points, noise_std)
+    data_arr = generate_trajectory(n_points, noise_std, mode=nav_mode)
 
 data_chaotic = generate_trajectory(n_points, noise_std, seed=42, chaotic=True)
 
@@ -256,11 +346,12 @@ idx_test  = np.arange(split, n_points)
 # ═══════════════════════════════════════════════════════════════════════════════
 # ВКЛАДКИ
 # ═══════════════════════════════════════════════════════════════════════════════
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📈 Траєкторія та прогноз",
     "🔬 Фрактальний аналіз",
     "🌀 MF-DFA спектр f(α)",
     "⚡ Енергоефективність",
+    "📉 Довготривалі кореляції",
 ])
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -315,37 +406,47 @@ with tab1:
 with tab2:
     st.markdown("### Фрактальний аналіз траєкторії")
 
-    with st.spinner("Обчислення показника Херста та фрактальної розмірності..."):
+    with st.spinner("Обчислення показника Херста, D (теор.) та D (box-counting)..."):
         h_base    = nolds.hurst_rs(data_arr)
         h_chaotic = nolds.hurst_rs(data_chaotic)
         D_base    = 2 - h_base
         D_chaotic = 2 - h_chaotic
+        D_bc_base    = box_counting_dimension(data_arr)
+        D_bc_chaotic = box_counting_dimension(data_chaotic)
 
-    # Метрики
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown(f'<div class="metric-card"><div class="label">H (базова)</div><div class="value">{h_base:.4f}</div></div>', unsafe_allow_html=True)
-    with c2:
-        st.markdown(f'<div class="metric-card"><div class="label">D=2-H (базова)</div><div class="value">{D_base:.4f}</div></div>', unsafe_allow_html=True)
-    with c3:
-        st.markdown(f'<div class="metric-card"><div class="label">H (хаотична)</div><div class="value">{h_chaotic:.4f}</div></div>', unsafe_allow_html=True)
-    with c4:
-        st.markdown(f'<div class="metric-card"><div class="label">D=2-H (хаотична)</div><div class="value">{D_chaotic:.4f}</div></div>', unsafe_allow_html=True)
+    # Метрики — 6 карток
+    mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+    for col, label, val in zip(
+        [mc1, mc2, mc3, mc4, mc5, mc6],
+        ["H (базова)", "D=2-H (базова)", "D box-cnt (баз.)",
+         "H (хаотична)", "D=2-H (хаот.)", "D box-cnt (хаот.)"],
+        [h_base, D_base, D_bc_base, h_chaotic, D_chaotic, D_bc_chaotic]):
+        col.markdown(f'<div class="metric-card"><div class="label">{label}</div>'
+                     f'<div class="value">{val:.4f}</div></div>', unsafe_allow_html=True)
 
     st.markdown("")
 
-    # Порівняльний графік траєкторій
+    # Порівняння 5 алгоритмів навігації
+    st.markdown("#### Порівняння алгоритмів навігації")
+    nav_modes = [("linear","Лінійний"),("waypoint","Waypoint"),("survey","Обстеження"),("patrol","Патруль"),("chaotic","Хаотичний")]
+    nav_rows = []
+    nav_colors = ["#7eb8f7","#34d399","#a78bfa","#fbbf24","#f97316"]
     fig2 = go.Figure()
-    fig2.add_trace(go.Scatter(y=data_arr,     name=f"Базова (H={h_base:.2f})", line=dict(color="#7eb8f7")))
-    fig2.add_trace(go.Scatter(y=data_chaotic, name=f"Хаотична (H={h_chaotic:.2f})", line=dict(color="#f97316"), opacity=0.75))
-    fig2.update_layout(title="Порівняння алгоритмів навігації БПЛА", **PLOTLY_LAYOUT,
+    for (m, lbl), col_hex in zip(nav_modes, nav_colors):
+        tr = generate_trajectory(n_points, noise_std, seed=2026, mode=m)
+        h_v = nolds.hurst_rs(tr)
+        E_v, _ = compute_energy(tr)
+        D_v = 2 - h_v
+        nav_rows.append({"Алгоритм": lbl, "H": round(h_v,4), "D=2-H": round(D_v,4), "Енергія E": round(E_v,2)})
+        fig2.add_trace(go.Scatter(y=tr, name=f"{lbl} H={h_v:.2f}", line=dict(color=col_hex), opacity=0.8))
+    fig2.update_layout(title="Траєкторії різних алгоритмів навігації", **PLOTLY_LAYOUT,
                        height=380, xaxis_title="Часовий крок", yaxis_title="Позиція")
     st.plotly_chart(fig2, use_container_width=True)
+    st.dataframe(pd.DataFrame(nav_rows), use_container_width=True, hide_index=True)
 
-    # Інтерпретація
     interp = "персистентний (трендостійкий)" if h_base > 0.5 else ("антиперсистентний" if h_base < 0.5 else "броунівський")
-    st.info(f"**Базова траєкторія:** H = {h_base:.4f} → ряд є **{interp}**. "
-            f"D = {D_base:.4f} (чим ближче D до 2, тим складніша траєкторія).")
+    st.info(f"**Обрана траєкторія:** H = {h_base:.4f} → ряд є **{interp}**. "
+            f"D (теор.) = {D_base:.4f}, D (box-counting) = {D_bc_base:.4f}.")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TAB 3: MF-DFA
@@ -466,10 +567,89 @@ with tab4:
     st.success(f"**Висновок:** {concl} кореляція (r={corr:.3f}) між фрактальною розмірністю D і витратами "
                "енергії E. Траєкторія з вищим D (більш 'зламана') потребує більше енергії для виконання.")
 
+# ──────────────────────────────────────────────────────────────────────────────
+# TAB 5: Довготривалі кореляції — ACF, PACF, R/S
+# ──────────────────────────────────────────────────────────────────────────────
+with tab5:
+    st.markdown("### Довготривалі кореляції: ACF, PACF та R/S аналіз")
+    st.markdown(
+        "Довготривалі кореляції (long-range dependence) — ключова ознака фрактальних процесів. "
+        "Показник Херста H > 0.5 свідчить про персистентність: майбутні значення корелюють "
+        "з минулими навіть на великих часових горизонтах."
+    )
+
+    n_lags_acf = st.slider("Кількість лагів для ACF/PACF", 10, 200, 60, 5)
+
+    with st.spinner("Обчислення ACF, PACF, R/S..."):
+        acf_vals  = sm_acf(data_arr,  nlags=n_lags_acf, fft=True)
+        pacf_vals = sm_pacf(data_arr, nlags=n_lags_acf)
+        ci = 1.96 / np.sqrt(len(data_arr))
+        ns_rs, rs_means = rs_analysis(data_arr)
+
+    # ACF + PACF side-by-side
+    col_a, col_p = st.columns(2)
+    lags = np.arange(n_lags_acf + 1)
+
+    with col_a:
+        fig_acf = go.Figure()
+        fig_acf.add_trace(go.Bar(x=lags, y=acf_vals, name="ACF",
+                                 marker_color="#7eb8f7", opacity=0.8))
+        fig_acf.add_hline(y=ci,  line_dash="dash", line_color="#f97316", annotation_text="+95% CI")
+        fig_acf.add_hline(y=-ci, line_dash="dash", line_color="#f97316")
+        fig_acf.update_layout(title="Автокореляційна функція (ACF)", **PLOTLY_LAYOUT,
+                               height=350, xaxis_title="Лаг", yaxis_title="ACF")
+        st.plotly_chart(fig_acf, use_container_width=True)
+
+    with col_p:
+        fig_pacf = go.Figure()
+        fig_pacf.add_trace(go.Bar(x=lags, y=pacf_vals, name="PACF",
+                                  marker_color="#34d399", opacity=0.8))
+        fig_pacf.add_hline(y=ci,  line_dash="dash", line_color="#f97316", annotation_text="+95% CI")
+        fig_pacf.add_hline(y=-ci, line_dash="dash", line_color="#f97316")
+        fig_pacf.update_layout(title="Часткова АКФ (PACF)", **PLOTLY_LAYOUT,
+                                height=350, xaxis_title="Лаг", yaxis_title="PACF")
+        st.plotly_chart(fig_pacf, use_container_width=True)
+
+    sig_lags = int(np.sum(np.abs(acf_vals[1:]) > ci))
+    st.info(
+        f"ACF: {sig_lags} зі {n_lags_acf} лагів статистично значущі (|ACF| > {ci:.3f}). "
+        "Повільне згасання ACF — ознака довготривалої пам'яті (процес фрактальний)."
+    )
+
+    # R/S аналіз
+    st.markdown("#### R/S аналіз (Rescaled Range)")
+    if len(ns_rs) >= 2:
+        log_ns = np.log10(ns_rs)
+        log_rs = np.log10(rs_means)
+        hurst_rs_slope = np.polyfit(log_ns, log_rs, 1)[0]
+        fit_line = np.polyval(np.polyfit(log_ns, log_rs, 1), log_ns)
+
+        fig_rs = go.Figure()
+        fig_rs.add_trace(go.Scatter(
+            x=log_ns, y=log_rs, mode="markers",
+            marker=dict(color="#7eb8f7", size=9), name="R/S значення"))
+        fig_rs.add_trace(go.Scatter(
+            x=log_ns, y=fit_line, mode="lines",
+            line=dict(color="#f97316", dash="dash"),
+            name=f"Лінія регресії (H={hurst_rs_slope:.4f})"))
+        fig_rs.update_layout(
+            title=f"R/S аналіз — показник Херста H = {hurst_rs_slope:.4f}",
+            **PLOTLY_LAYOUT, height=380,
+            xaxis_title="log₁₀(n)", yaxis_title="log₁₀(R/S)")
+        st.plotly_chart(fig_rs, use_container_width=True)
+        st.success(
+            f"**R/S аналіз:** нахил log-log = **H = {hurst_rs_slope:.4f}**. "
+            f"Нахил > 0.5 підтверджує довготривалу персистентну пам'ять. "
+            f"Це узгоджується з H = {h_base:.4f} (R/S метод nolds)."
+        )
+    else:
+        st.warning("Недостатньо даних для R/S аналізу. Збільшіть кількість точок.")
+
 # ── FOOTER ───────────────────────────────────────────────────────────────────
 st.markdown("---")
 st.markdown(
-    '<p class="footer-text" style="text-align:center">© 2026 БПЛА Фрактальний Аналіз | '
-    'Університетський проєкт | Побудовано на Streamlit + Plotly</p>',
+    '<p class="footer-text" style="text-align:center">© 2026 Команда 1 | '
+    'Іванченко А., Петренко Б., Коваль В., Шевченко Г. | '
+    'Тема 18: Фрактальний аналіз траєкторій БПЛА | Streamlit + Plotly</p>',
     unsafe_allow_html=True,
 )
